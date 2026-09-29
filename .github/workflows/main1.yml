@@ -1,119 +1,285 @@
-name: Ubuntu + Tailscale + Ollama + Qwen3-Coder
+name: Qwen3-Coder API (Ubuntu + Tailscale + Ollama)
+
+# ---------------------------------------------------------------------------
+# REQUIRED repo secrets:
+#   TAILSCALE_AUTHKEY  - Tailscale auth key (ephemeral + reusable recommended)
+#   API_KEY            - your own API key, 16+ chars, letters/numbers/_/- only
+#                        (generate one:  openssl rand -hex 24)
+# OPTIONAL repo variable:
+#   RUNNER_LABEL       - label of a paid "larger runner" (e.g. 8-core/32GB+).
+#                        Empty = free standard runner (4 vCPU / 16 GB RAM).
+#
+# After the run starts, open the run's Summary page: it shows the Base URL.
+# Client settings:
+#   Base URL : http://<tailscale-ip>:8080/v1
+#   API key  : the value you stored in the API_KEY secret
+#   Model    : qwen3-coder   (or the name printed in the summary)
+# ---------------------------------------------------------------------------
 
 on:
   workflow_dispatch:
+    inputs:
+      model_source:
+        description: "Model to pull. 16GB runner: 2-bit quant. 32GB+ runner: use qwen3-coder:30b"
+        default: "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q2_K_XL"
+        required: true
+      fallback_model:
+        description: "Used automatically if the main model fails to pull/load"
+        default: "qwen2.5-coder:7b"
+        required: true
+      context_length:
+        description: "Context window in tokens (bigger = more RAM)"
+        default: "16384"
+        required: true
+      extra_models:
+        description: "Optional extra models, comma separated (e.g. nomic-embed-text)"
+        default: ""
+        required: false
+      total_cycles:
+        description: "How many ~5.5h runs to chain (4 = ~22h, 1 = single run)"
+        default: "4"
+        required: true
+      cycle:
+        description: "Current cycle (set automatically, leave as 1)"
+        default: "1"
+        required: true
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
-  ollama-tailscale:
-    runs-on: ubuntu-latest          # 4 CPU, 16 GB RAM, 14 GB SSD
-    timeout-minutes: 350
+  ai-api:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 350   # GitHub hard limit is 360 min per job
+
+    env:
+      MODEL_SOURCE: ${{ inputs.model_source }}
+      FALLBACK_MODEL: ${{ inputs.fallback_model }}
+      CTX: ${{ inputs.context_length }}
+      EXTRA_MODELS: ${{ inputs.extra_models }}
+      TOTAL_CYCLES: ${{ inputs.total_cycles }}
+      CYCLE: ${{ inputs.cycle }}
+      API_KEY: ${{ secrets.API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      MODEL_ALIAS: qwen3-coder
+      OLLAMA_PORT: "11434"
+      API_PORT: "8080"
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Install Tailscale and connect to your tailnet
-      # ------------------------------------------------------------
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          # Optional: give the ephemeral node a descriptive name
-          # tags: tag:ci
-        # The action automatically creates an ephemeral node that is
-        # removed when the job finishes.
+      - name: Validate secrets
+        run: |
+          if [ -z "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then echo "Missing secret TAILSCALE_AUTHKEY"; exit 1; fi
+          if ! printf '%s' "$API_KEY" | grep -Eq '^[A-Za-z0-9_-]{16,}$'; then
+            echo "API_KEY secret missing or invalid (need 16+ chars of A-Z a-z 0-9 _ -)"; exit 1
+          fi
 
-      # ------------------------------------------------------------
-      # 2. Install Ollama (official install script)
-      # ------------------------------------------------------------
-      - name: Install Ollama
+      - name: Show hardware
+        run: |
+          nproc; free -h; df -h /; lscpu | grep -E "Model name|Flags" | head -n1
+          nvidia-smi || echo "No GPU (CPU-only runner)"
+
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          # Swap lets a slightly-too-big model still load instead of being OOM-killed
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=20
+          df -h /; free -h
+
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailnet
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          sudo tailscale up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname="gh-ai-${GITHUB_RUN_ID}" \
+            --accept-dns=false \
+            --ssh
+
+          TS_IP=""
+          for i in $(seq 1 12); do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 5
+          done
+          [ -n "$TS_IP" ] || { echo "Tailscale IP not assigned"; exit 1; }
+          DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "DNS_NAME=$DNS_NAME" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $TS_IP  ($DNS_NAME)"
+
+      - name: Install Ollama and nginx
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama || true
+          sudo systemctl disable ollama || true
+          sudo apt-get update -y
+          sudo apt-get install -y nginx
+          sudo systemctl stop nginx || true
+          sudo systemctl disable nginx || true
 
-      # ------------------------------------------------------------
-      # 3. Cache the Ollama model directory for faster subsequent runs
-      # ------------------------------------------------------------
-      - name: Cache Ollama models
-        uses: actions/cache@v4
-        with:
-          path: ~/.ollama/models
-          key: ollama-models-qwen3-coder-${{ runner.os }}-${{ hashFiles('**/ollama-model-version.txt') }}
-          restore-keys: |
-            ollama-models-qwen3-coder-
-
-      # ------------------------------------------------------------
-      # 4. Pull the Qwen3-Coder model (30B-A3B, Q4_K_M ~18 GB)
-      #    If you need a smaller footprint, use a higher quantization
-      #    level (e.g., Q3_K_S ~13 GB) – see the notes below.
-      # ------------------------------------------------------------
-      - name: Pull Qwen3-Coder model
+      - name: Start Ollama (localhost only, tuned)
         run: |
-          ollama pull qwen3-coder:30b-a3b-q4_K_M
-          # For a lighter model (faster on CPU):
-          # ollama pull qwen3-coder:30b-a3b-q3_K_S
-
-      # ------------------------------------------------------------
-      # 5. Start Ollama server with performance‑tuned environment
-      # ------------------------------------------------------------
-      - name: Start Ollama server
-        env:
-          OLLAMA_NUM_PARALLEL: "4"          # match CPU cores (4)
-          OLLAMA_MAX_LOADED_MODELS: "1"     # only one model in memory
-          OLLAMA_KEEP_ALIVE: "-1"           # never unload the model
-          OLLAMA_CONTEXT_SIZE: "32768"      # 32k context (adjust as needed)
-          OLLAMA_NUM_THREAD: "4"            # use all 4 vCPUs
-          OLLAMA_FLASH_ATTENTION: "1"       # enable flash attention
-        run: |
-          ollama serve &
-          # wait for the server to be ready
-          for i in {1..30}; do
-            if curl -s http://localhost:11434/api/tags > /dev/null; then
-              echo "Ollama server is up."
-              break
-            fi
-            echo "Waiting for Ollama..."
+          cat > "$HOME/ollama.env" <<EOF
+          export OLLAMA_HOST=127.0.0.1:${OLLAMA_PORT}
+          export OLLAMA_KEEP_ALIVE=-1
+          export OLLAMA_CONTEXT_LENGTH=${CTX}
+          export OLLAMA_FLASH_ATTENTION=1
+          export OLLAMA_KV_CACHE_TYPE=q8_0
+          export OLLAMA_NUM_PARALLEL=1
+          export OLLAMA_MAX_LOADED_MODELS=1
+          EOF
+          . "$HOME/ollama.env"
+          nohup ollama serve > "$HOME/ollama.log" 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fs "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null && break
             sleep 2
           done
+          curl -fs "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null || { cat "$HOME/ollama.log"; exit 1; }
 
-      # ------------------------------------------------------------
-      # 6. Get the Tailscale IP of this runner
-      # ------------------------------------------------------------
-      - name: Get Tailscale IP
-        id: tailscale-ip
+      - name: Pull model (with fallback)
         run: |
-          TS_IP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-          echo "Tailscale IP: $TS_IP"
+          . "$HOME/ollama.env"
 
-      # ------------------------------------------------------------
-      # 7. Verify the Ollama API is reachable over Tailscale
-      # ------------------------------------------------------------
-      - name: Verify Ollama over Tailscale
-        run: |
-          curl -s http://${{ env.TAILSCALE_IP }}:11434/api/tags | head -c 500
-          echo ""
-          echo "Ollama is reachable via Tailscale."
+          try_model() {
+            local src="$1" name="$2"
+            echo "== Trying $src =="
+            for attempt in 1 2 3; do
+              ollama pull "$src" && break
+              echo "pull attempt $attempt failed"; sleep 10
+              [ "$attempt" = 3 ] && return 1
+            done
+            [ "$src" != "$name" ] && ollama cp "$src" "$name"
+            curl -fs --max-time 900 "http://127.0.0.1:${OLLAMA_PORT}/api/generate" \
+              -d "{\"model\":\"${name}\",\"prompt\":\"Write a one-line Python hello world.\",\"stream\":false,\"options\":{\"num_predict\":32}}" \
+              | head -c 300 && echo && return 0
+            return 1
+          }
 
-      # ------------------------------------------------------------
-      # 8. Keep the runner alive and optionally run a test prompt
-      # ------------------------------------------------------------
-      - name: Keep runner alive and test model
+          if try_model "$MODEL_SOURCE" "$MODEL_ALIAS"; then
+            SERVED="$MODEL_ALIAS"
+          else
+            echo "Main model failed, using fallback $FALLBACK_MODEL"
+            ollama rm "$MODEL_SOURCE" || true
+            try_model "$FALLBACK_MODEL" "$FALLBACK_MODEL" || { echo "Fallback failed too"; tail -n 50 "$HOME/ollama.log"; exit 1; }
+            SERVED="$FALLBACK_MODEL"
+          fi
+          echo "SERVED=$SERVED" >> "$GITHUB_ENV"
+
+          if [ -n "$EXTRA_MODELS" ]; then
+            IFS=',' read -ra M <<< "$EXTRA_MODELS"
+            for m in "${M[@]}"; do ollama pull "$(echo "$m" | xargs)" || true; done
+          fi
+          ollama list
+          free -h
+
+      - name: Start authenticated API gateway (nginx)
         run: |
-          echo "=== OLLAMA ACCESS ==="
-          echo "Address: http://${{ env.TAILSCALE_IP }}:11434"
-          echo "Model: qwen3-coder:30b-a3b-q4_K_M"
-          echo "====================="
-          
-          # Quick test prompt (optional, comment out if not needed)
-          curl -s http://localhost:11434/api/generate -d '{
-            "model": "qwen3-coder:30b-a3b-q4_K_M",
-            "prompt": "Write a hello world in Python.",
-            "stream": false
-          }' | jq -r '.response' | head -20
-          
-          echo ""
-          echo "Runner will stay alive for 5 hours. Use Tailscale to connect."
-          
-          # Keep the job running so the runner stays alive
-          while true; do
-            echo "[$(date)] Runner active – Tailscale IP: $TAILSCALE_IP"
-            sleep 300
+          cat > /tmp/nginx-ai.conf <<EOF
+          worker_processes auto;
+          pid /tmp/nginx-ai.pid;
+          error_log /tmp/nginx-ai-error.log;
+          events { worker_connections 1024; }
+          http {
+            access_log off;
+            server {
+              listen ${TS_IP}:${API_PORT};
+              client_max_body_size 100m;
+              proxy_buffering off;
+              proxy_request_buffering off;
+              proxy_read_timeout 3600s;
+              proxy_send_timeout 3600s;
+              location / {
+                if (\$http_authorization != "Bearer ${API_KEY}") {
+                  return 401 '{"error":{"message":"invalid api key","type":"auth_error"}}';
+                }
+                proxy_pass http://127.0.0.1:${OLLAMA_PORT};
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_set_header Host 127.0.0.1:${OLLAMA_PORT};
+              }
+            }
+          }
+          EOF
+          chmod 600 /tmp/nginx-ai.conf
+          sudo nginx -t -c /tmp/nginx-ai.conf
+          sudo nginx -c /tmp/nginx-ai.conf
+          sleep 2
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${API_KEY}" "http://${TS_IP}:${API_PORT}/v1/models")
+          bad=$(curl -s -o /dev/null -w '%{http_code}' "http://${TS_IP}:${API_PORT}/v1/models")
+          echo "with key: $code | without key: $bad"
+          [ "$code" = "200" ] && [ "$bad" = "401" ]
+
+      - name: Publish connection info
+        run: |
+          {
+            echo "## AI API ready (cycle ${CYCLE}/${TOTAL_CYCLES})"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Base URL | \`http://${TS_IP}:${API_PORT}/v1\` |"
+            echo "| Base URL (MagicDNS) | \`http://${DNS_NAME}:${API_PORT}/v1\` |"
+            echo "| API key | your \`API_KEY\` secret |"
+            echo "| Model | \`${SERVED}\` |"
+            echo "| Context | ${CTX} tokens |"
+            echo ""
+            echo "Only devices on your Tailscale network can reach this address."
+            echo ""
+            echo '```bash'
+            echo "curl http://${TS_IP}:${API_PORT}/v1/chat/completions \\"
+            echo "  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \\"
+            echo "  -d '{\"model\":\"${SERVED}\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python quicksort\"}]}'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=========== AI API READY ==========="
+          echo "Base URL : http://${TS_IP}:${API_PORT}/v1"
+          echo "MagicDNS : http://${DNS_NAME}:${API_PORT}/v1"
+          echo "Model    : ${SERVED}"
+          echo "API key  : (your API_KEY secret)"
+          echo "===================================="
+
+      - name: Keep alive, watchdog, and chain next run
+        run: |
+          . "$HOME/ollama.env"
+          DISPATCHED=0
+          echo "Cycle ${CYCLE} of ${TOTAL_CYCLES}"
+
+          # Jobs cap at 6h: hand over to a fresh run at ~5h15m, stay up until ~5h40m.
+          while [ "$SECONDS" -lt 20400 ]; do
+            if ! curl -fs "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null; then
+              echo "[$(date)] Ollama down, restarting..."
+              nohup ollama serve >> "$HOME/ollama.log" 2>&1 &
+              sleep 10
+            fi
+            if ! curl -fs -o /dev/null -H "Authorization: Bearer ${API_KEY}" "http://${TS_IP}:${API_PORT}/v1/models"; then
+              echo "[$(date)] Gateway down, restarting..."
+              sudo nginx -c /tmp/nginx-ai.conf || sudo nginx -c /tmp/nginx-ai.conf -s reload || true
+            fi
+
+            if [ "$SECONDS" -ge 18900 ] && [ "$DISPATCHED" -eq 0 ] && [ "$CYCLE" -lt "$TOTAL_CYCLES" ]; then
+              echo "Starting next cycle: $((CYCLE+1))"
+              gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" \
+                --ref "${{ github.ref_name }}" \
+                -f model_source="$MODEL_SOURCE" -f fallback_model="$FALLBACK_MODEL" \
+                -f context_length="$CTX" -f extra_models="$EXTRA_MODELS" \
+                -f total_cycles="$TOTAL_CYCLES" -f cycle="$((CYCLE+1))"
+              DISPATCHED=1
+              echo "NEW ADDRESS: see the next run's Summary (Tailscale IP changes each cycle)."
+            fi
+
+            echo "[$(date)] alive | $(free -m | awk '/Mem/{print $3"MB used"}')"
+            sleep 60
           done
+
+          [ "$CYCLE" -ge "$TOTAL_CYCLES" ] && echo "Final cycle finished."
+          sudo tailscale logout || true
