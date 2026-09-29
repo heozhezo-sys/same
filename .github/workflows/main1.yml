@@ -60,7 +60,7 @@ jobs:
       EXTRA_MODELS: ${{ inputs.extra_models }}
       TOTAL_CYCLES: ${{ inputs.total_cycles }}
       CYCLE: ${{ inputs.cycle }}
-      API_KEY: ${{ secrets.API_KEY }}
+      API_KEY: ${{ secrets.tskey-api-kxjw7w4QPk11CNTRL-KWt2N34NEdCxSWkFfYnecCXwr72AWeQ5 }}
       GH_TOKEN: ${{ github.token }}
       MODEL_ALIAS: qwen3-coder
       OLLAMA_PORT: "11434"
@@ -97,7 +97,7 @@ jobs:
 
       - name: Connect to Tailnet
         env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TS_AUTHKEY: ${{ secrets.tskey-auth-kUic6R7rAm11CNTRL-upboJfF3GBanggn7Kcn5Baec67rBDa1DF }}
         run: |
           sudo tailscale up \
             --authkey="$TS_AUTHKEY" \
