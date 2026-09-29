@@ -69,7 +69,7 @@ jobs:
     steps:
       - name: Validate secrets
         run: |
-          if [ -z "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then echo "Missing secret TAILSCALE_AUTHKEY"; exit 1; fi
+          if [ -z "${{ secrets.tskey-auth-kUic6R7rAm11CNTRL-upboJfF3GBanggn7Kcn5Baec67rBDa1DF }}" ]; then echo "Missing secret TAILSCALE_AUTHKEY"; exit 1; fi
           if ! printf '%s' "$API_KEY" | grep -Eq '^[A-Za-z0-9_-]{16,}$'; then
             echo "API_KEY secret missing or invalid (need 16+ chars of A-Z a-z 0-9 _ -)"; exit 1
           fi
