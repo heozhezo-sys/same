@@ -1,0 +1,447 @@
+name: Ubuntu + Tailscale + xRDP + Download Script
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+
+      # ============================================================
+      # 1. UPDATE UBUNTU
+      # ============================================================
+      - name: Update Ubuntu
+        shell: bash
+        run: |
+          set -e
+
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+          echo "Ubuntu system updated."
+
+
+      # ============================================================
+      # 2. INSTALL DESKTOP + XRDP
+      # ============================================================
+      - name: Install XFCE Desktop and xRDP
+        shell: bash
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 \
+            xfce4-goodies \
+            xrdp \
+            dbus-x11 \
+            xorgxrdp \
+            curl \
+            wget \
+            unzip \
+            git \
+            net-tools \
+            iproute2 \
+            ca-certificates
+
+          echo "Desktop and xRDP installed."
+
+
+      # ============================================================
+      # 3. CONFIGURE XFCE FOR XRDP
+      # ============================================================
+      - name: Configure XFCE xRDP Session
+        shell: bash
+        run: |
+          set -e
+
+          # Configure XFCE as the desktop session
+          sudo tee /etc/xrdp/startwm.sh > /dev/null <<'EOF'
+          #!/bin/sh
+
+          export LANG=en_US.UTF-8
+          export LANGUAGE=en_US:en
+          export LC_ALL=en_US.UTF-8
+
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+
+          startxfce4
+          EOF
+
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # Add xrdp to ssl-cert group
+          sudo adduser xrdp ssl-cert || true
+
+          # Enable xRDP
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+
+          echo "xRDP configured."
+
+
+      # ============================================================
+      # 4. CREATE RDP USER
+      # ============================================================
+      - name: Create RDP User
+        shell: bash
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -e
+
+          if [ -z "$RDP_PASSWORD" ]; then
+            echo "ERROR: RDP_PASSWORD GitHub Secret is not configured."
+            exit 1
+          fi
+
+          # Remove old user if necessary
+          if id "RDP" >/dev/null 2>&1; then
+            echo "RDP user already exists."
+          else
+            sudo useradd \
+              -m \
+              -s /bin/bash \
+              RDP
+          fi
+
+          # Set password
+          echo "RDP:$RDP_PASSWORD" | sudo chpasswd
+
+          # Add user to useful groups
+          sudo usermod -aG sudo RDP
+
+          # Create XFCE configuration
+          sudo -u RDP bash -c 'echo "startxfce4" > ~/.xsession'
+          sudo chmod 644 /home/RDP/.xsession
+
+          # Make sure home directory belongs to user
+          sudo chown -R RDP:RDP /home/RDP
+
+          echo "RDP user created."
+
+
+      # ============================================================
+      # 5. CONFIGURE FIREWALL
+      # ============================================================
+      - name: Configure Firewall
+        shell: bash
+        run: |
+          set -e
+
+          # Ubuntu GitHub runners may not have UFW enabled.
+          # Allow RDP if UFW is available.
+          if command -v ufw >/dev/null 2>&1; then
+            sudo ufw allow 3389/tcp || true
+          fi
+
+          echo "RDP firewall configuration completed."
+
+
+      # ============================================================
+      # 6. INSTALL TAILSCALE
+      # ============================================================
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -e
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          sudo systemctl enable --now tailscaled
+
+          echo "Tailscale installed."
+
+
+      # ============================================================
+      # 7. CONNECT TO TAILSCALE
+      # ============================================================
+      - name: Establish Tailscale Connection
+        shell: bash
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -e
+
+          if [ -z "$TAILSCALE_AUTHKEY" ]; then
+            echo "ERROR: TAILSCALE_AUTHKEY GitHub Secret is not configured."
+            exit 1
+          fi
+
+          HOSTNAME="gh-ubuntu-${GITHUB_RUN_ID}"
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="$HOSTNAME"
+
+          echo "Waiting for Tailscale IP..."
+
+          TS_IP=""
+
+          for i in {1..20}; do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n 1 || true)
+
+            if [ -n "$TS_IP" ]; then
+              break
+            fi
+
+            echo "Waiting for Tailscale..."
+            sleep 5
+          done
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale IP was not assigned."
+            sudo tailscale status
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "======================================"
+          echo "       TAILSCALE CONNECTION"
+          echo "======================================"
+          echo "Hostname: $HOSTNAME"
+          echo "IP:       $TS_IP"
+          echo "======================================"
+
+
+      # ============================================================
+      # 8. RESTART XRDP AFTER TAILSCALE
+      # ============================================================
+      - name: Restart xRDP
+        shell: bash
+        run: |
+          set -e
+
+          sudo systemctl restart xrdp
+
+          sleep 5
+
+          sudo systemctl status xrdp --no-pager || true
+
+          echo "xRDP restarted."
+
+
+      # ============================================================
+      # 9. VERIFY RDP PORT
+      # ============================================================
+      - name: Verify RDP Accessibility
+        shell: bash
+        run: |
+          set -e
+
+          echo ""
+          echo "Testing RDP on:"
+          echo "$TAILSCALE_IP:3389"
+          echo ""
+
+          if command -v nc >/dev/null 2>&1; then
+            if nc -z -w 10 "$TAILSCALE_IP" 3389; then
+              echo "RDP port 3389 is accessible."
+            else
+              echo "WARNING: RDP port test failed."
+            fi
+          else
+            echo "netcat not installed."
+          fi
+
+          echo ""
+          echo "Listening ports:"
+          sudo ss -tulpn | grep 3389 || true
+
+
+      # ============================================================
+      # 10. DISPLAY RDP INFORMATION
+      # ============================================================
+      - name: Display RDP Information
+        shell: bash
+        run: |
+          echo ""
+          echo "======================================================"
+          echo "                 UBUNTU RDP ACCESS"
+          echo "======================================================"
+          echo ""
+          echo "RDP Address:"
+          echo "$TAILSCALE_IP"
+          echo ""
+          echo "RDP Port:"
+          echo "3389"
+          echo ""
+          echo "Username:"
+          echo "RDP"
+          echo ""
+          echo "Password:"
+          echo "Stored in GitHub Secret RDP_PASSWORD"
+          echo ""
+          echo "Desktop:"
+          echo "XFCE"
+          echo ""
+          echo "Connection:"
+          echo "$TAILSCALE_IP:3389"
+          echo ""
+          echo "======================================================"
+
+
+      # ============================================================
+      # 11. DOWNLOAD SCRIPT
+      # ============================================================
+      - name: Download Script
+        shell: bash
+        run: |
+          set -e
+
+          DOWNLOAD_URL="https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.sh"
+
+          mkdir -p /home/RDP/Desktop
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            "$DOWNLOAD_URL" \
+            -o /home/RDP/Desktop/Downloads.sh
+
+          chmod +x /home/RDP/Desktop/Downloads.sh
+
+          chown RDP:RDP /home/RDP/Desktop/Downloads.sh
+
+          echo "Downloads.sh downloaded."
+
+
+      # ============================================================
+      # 12. RUN DOWNLOAD SCRIPT
+      # ============================================================
+      - name: Execute Download Script
+        shell: bash
+        run: |
+          set -e
+
+          SCRIPT="/home/RDP/Desktop/Downloads.sh"
+
+          if [ -f "$SCRIPT" ]; then
+            echo "Executing Downloads.sh..."
+
+            sudo -u RDP bash "$SCRIPT" || {
+              echo "WARNING: Downloads.sh returned an error."
+            }
+
+            echo "Download script execution completed."
+          else
+            echo "ERROR: Downloads.sh was not found."
+            exit 1
+          fi
+
+
+      # ============================================================
+      # 13. CREATE STARTUP SCRIPT
+      # ============================================================
+      - name: Configure RDP Startup
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p /home/RDP/.config/autostart
+
+          cat <<'EOF' | sudo tee /home/RDP/.config/autostart/download-script.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Download Script
+          Comment=Run Downloads.sh
+          Exec=/home/RDP/Desktop/Downloads.sh
+          Terminal=true
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          sudo chown -R RDP:RDP /home/RDP/.config
+
+          echo "Startup script configured."
+
+
+      # ============================================================
+      # 14. FINAL SYSTEM INFORMATION
+      # ============================================================
+      - name: Show System Information
+        shell: bash
+        run: |
+          echo ""
+          echo "======================================================"
+          echo "                 SYSTEM INFORMATION"
+          echo "======================================================"
+
+          echo ""
+          echo "Ubuntu:"
+          lsb_release -a 2>/dev/null || true
+
+          echo ""
+          echo "Kernel:"
+          uname -a
+
+          echo ""
+          echo "CPU:"
+          nproc
+
+          echo ""
+          echo "Memory:"
+          free -h
+
+          echo ""
+          echo "Disk:"
+          df -h /
+
+          echo ""
+          echo "Tailscale:"
+          sudo tailscale status || true
+
+          echo ""
+          echo "xRDP:"
+          sudo systemctl status xrdp --no-pager || true
+
+          echo ""
+          echo "======================================================"
+
+
+      # ============================================================
+      # 15. KEEP RUNNER ALIVE
+      # ============================================================
+      - name: Maintain Ubuntu RDP Session
+        shell: bash
+        run: |
+          echo ""
+          echo "======================================================"
+          echo "              UBUNTU RDP IS ACTIVE"
+          echo "======================================================"
+          echo ""
+          echo "Address : $TAILSCALE_IP"
+          echo "Port    : 3389"
+          echo "User    : RDP"
+          echo "Desktop : XFCE"
+          echo ""
+          echo "Use Microsoft Remote Desktop / Remmina:"
+          echo ""
+          echo "$TAILSCALE_IP:3389"
+          echo ""
+          echo "======================================================"
+          echo ""
+
+          while true; do
+            echo "[$(date)] Ubuntu RDP Active"
+            echo "Tailscale IP: $TAILSCALE_IP"
+
+            # Make sure services remain alive
+            if ! systemctl is-active --quiet xrdp; then
+              echo "xRDP stopped. Restarting..."
+              sudo systemctl restart xrdp
+            fi
+
+            if ! systemctl is-active --quiet tailscaled; then
+              echo "Tailscaled stopped. Restarting..."
+              sudo systemctl restart tailscaled
+            fi
+
+            sleep 300
+          done
